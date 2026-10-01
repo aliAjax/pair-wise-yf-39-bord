@@ -85,6 +85,14 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts[:3] == ["api", "sync", "changes"]:
+                    query = parse_qs(parsed.query)
+                    device_id = query.get("device_id", [None])[0]
+                    batch_id = query.get("batch_id", [None])[0]
+                    return self._send(
+                        200,
+                        {"items": service.sync_changes(device_id, batch_id)},
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -107,6 +115,17 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if len(parts) == 3 and parts == ["api", "sync", "batch"]:
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.sync_batch(
+                            actor,
+                            body.pop("device_id", None),
+                            body.pop("batch_id", None),
+                            body.pop("changes", []),
+                        ),
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

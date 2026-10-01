@@ -54,6 +54,28 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS sync_batches (
+                    device_id TEXT NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    response TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(device_id, batch_id)
+                );
+                CREATE TABLE IF NOT EXISTS sync_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    op TEXT NOT NULL,
+                    baseline_version INTEGER,
+                    applied_version INTEGER,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(device_id, batch_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sync_changes_entity
+                    ON sync_changes(entity_id, id);
             """)
 
     @staticmethod
@@ -140,6 +162,15 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def force_update_entity(self, entity_id, status, data):
+        """Version-bumping update without an optimistic-lock check.
+
+        Used for server-side conflict branches (disputed candidates, sample
+        holds and cluster re-verification), which are derived rather than
+        client-driven.
+        """
+        return self.update_entity(entity_id, None, status, data)
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(
@@ -195,6 +226,76 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def get_sync_batch(self, device_id, batch_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT response FROM sync_batches WHERE device_id = ? AND batch_id = ?",
+                (device_id, batch_id),
+            ).fetchone()
+        return json.loads(row["response"]) if row else None
+
+    def save_sync_batch(self, device_id, batch_id, actor_id, response):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO sync_batches(device_id, batch_id, actor_id, response, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    device_id,
+                    batch_id,
+                    actor_id,
+                    json.dumps(response, ensure_ascii=False, sort_keys=True),
+                    utcnow(),
+                ),
+            )
+
+    def append_sync_change(
+        self, device_id, batch_id, seq, entity_id, op, baseline_version, applied_version
+    ):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO sync_changes(device_id, batch_id, seq, entity_id, op, "
+                "baseline_version, applied_version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    device_id,
+                    batch_id,
+                    seq,
+                    entity_id,
+                    op,
+                    baseline_version,
+                    applied_version,
+                    utcnow(),
+                ),
+            )
+
+    def list_sync_changes(self, device_id=None, batch_id=None):
+        clauses = []
+        params = []
+        if device_id:
+            clauses.append("device_id = ?")
+            params.append(device_id)
+        if batch_id:
+            clauses.append("batch_id = ?")
+            params.append(batch_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sync_changes" + where + " ORDER BY id", params
+            ).fetchall()
+        return [
+            {
+                "device_id": row["device_id"],
+                "batch_id": row["batch_id"],
+                "seq": row["seq"],
+                "entity_id": row["entity_id"],
+                "op": row["op"],
+                "baseline_version": row["baseline_version"],
+                "applied_version": row["applied_version"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def ping(self):
         with self._connect() as connection:
