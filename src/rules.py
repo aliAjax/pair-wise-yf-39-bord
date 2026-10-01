@@ -28,6 +28,16 @@ def _validate_lab_result(actor, entity, data, lookup):
         raise ValidationError("lab result must be positive or negative")
 
 
+def _validate_confirm_cluster(actor, entity, data, lookup):
+    obs_ids = data.get("observation_ids") or []
+    points = []
+    for oid in obs_ids:
+        obs = _find_one(lookup, "observation", "id", oid)
+        if obs:
+            points.append(obs["data"])
+    return {"centroid": compute_centroid(points), "_last_observation_ids": list(obs_ids)}
+
+
 def _haversine_km(lat1, lon1, lat2, lon2):
     from math import asin, cos, radians, sin, sqrt
     dlat = radians(lat2 - lat1)
@@ -51,8 +61,16 @@ def is_cluster(observations, max_days=14, radius_km=10):
     return same_window and close
 
 
+def compute_centroid(observations):
+    if not observations:
+        return None
+    lat = sum(float(item["lat"]) for item in observations) / len(observations)
+    lon = sum(float(item["lon"]) for item in observations) / len(observations)
+    return [round(lat, 6), round(lon, 6)]
+
+
 CUSTOM_CREATE = {'observation': _validate_observation, 'sample': _validate_sample}
-CUSTOM_TRANSITIONS = {('sample', 'lab_result'): _validate_lab_result}
+CUSTOM_TRANSITIONS = {('sample', 'lab_result'): _validate_lab_result, ('cluster', 'confirm_cluster'): _validate_confirm_cluster}
 
 
 class RuleEngine:
@@ -62,6 +80,7 @@ class RuleEngine:
     CREATE_REQUIRED = {'observation': ('event_id', 'species', 'location', 'observed_at', 'lat', 'lon'), 'sample': ('observation_id', 'sample_code'), 'cluster': ('region',)}
     ACTION_REQUIRED = {('observation', 'submit'): ('location', 'observed_at'), ('observation', 'reject'): ('reason',), ('observation', 'link_sample'): ('sample_id',), ('sample', 'send_lab'): ('lab_id',), ('sample', 'lab_result'): ('result', 'result_at'), ('sample', 'retest'): ('reason',), ('sample', 'close'): ('outcome',), ('cluster', 'confirm_cluster'): ('observation_ids', 'centroid'), ('cluster', 'dismiss'): ('reason',)}
     CREATE_ROLES = {'observation': ('admin', 'field'), 'sample': ('admin', 'field'), 'cluster': ('admin', 'epidemiologist')}
+    ADJUDICATE_ROLES = ('admin', 'epidemiologist')
     ROLE_ACTIONS = {'submit': ('admin', 'field'), 'reject': ('admin', 'epidemiologist'), 'link_sample': ('admin', 'field'), 'send_lab': ('admin', 'field'), 'lab_result': ('admin', 'lab'), 'retest': ('admin', 'lab'), 'close': ('admin', 'epidemiologist'), 'confirm_cluster': ('admin', 'epidemiologist'), 'dismiss': ('admin', 'epidemiologist')}
 
     def normalize_kind(self, kind):
@@ -117,6 +136,24 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def validate_update(self, actor, kind, merged, lookup=None):
+        kind = self.normalize_kind(kind)
+        if kind not in self.INITIAL_STATUS:
+            raise ValidationError("unknown kind: " + str(kind))
+        self._ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
+        self._require(merged, self.CREATE_REQUIRED.get(kind, ()))
+        if kind == "observation" and not merged.get("species"):
+            raise ValidationError("species is required")
+        if kind == "sample":
+            observation = _find_one(lookup, "observation", "id", merged.get("observation_id"))
+            if not observation or observation["status"] not in ("submitted", "sampled"):
+                raise ValidationError("sample requires a submitted observation")
+        return merged
+
+    def validate_adjudicate(self, actor):
+        self._ensure_role(actor, self.ADJUDICATE_ROLES)
+        return actor
 
 
 def _find_one(lookup, kind, field, value):

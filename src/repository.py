@@ -30,7 +30,8 @@ class SQLiteRepository:
                     data TEXT NOT NULL,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    device_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_entities_kind_status
                     ON entities(kind, status);
@@ -54,7 +55,31 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS offline_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS adjudications (
+                    entity_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    candidates TEXT NOT NULL,
+                    decision TEXT,
+                    decided_by TEXT,
+                    created_at TEXT NOT NULL,
+                    decided_at TEXT
+                );
             """)
+            self._migrate(connection)
+
+    def _migrate(self, connection):
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(entities)")]
+        if "device_id" not in columns:
+            connection.execute("ALTER TABLE entities ADD COLUMN device_id TEXT")
 
     @staticmethod
     def _entity_from_row(row):
@@ -67,16 +92,17 @@ class SQLiteRepository:
             "created_by": row["created_by"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "device_id": row["device_id"] if "device_id" in row.keys() else None,
         }
 
-    def create_entity(self, entity_id, kind, status, data, actor_id):
+    def create_entity(self, entity_id, kind, status, data, actor_id, device_id=None):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
-                (entity_id, kind, status, payload, actor_id, now, now),
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at, device_id) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)",
+                (entity_id, kind, status, payload, actor_id, now, now, device_id),
             )
         return self.get_entity(entity_id)
 
@@ -110,7 +136,7 @@ class SQLiteRepository:
             if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
         ]
 
-    def update_entity(self, entity_id, expected_version, status, data):
+    def update_entity(self, entity_id, expected_version, status, data, device_id=None):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
         connection = self._connect()
@@ -128,9 +154,9 @@ class SQLiteRepository:
                     % (expected_version, current_version)
                 )
             connection.execute(
-                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
-                "WHERE id = ? AND version = ?",
-                (status, payload, now, entity_id, current_version),
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ?, "
+                "device_id = COALESCE(?, device_id) WHERE id = ? AND version = ?",
+                (status, payload, now, device_id, entity_id, current_version),
             )
             connection.commit()
         except Exception:
@@ -195,6 +221,82 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def get_batch(self, batch_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM offline_batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "batch_id": row["batch_id"],
+            "device_id": row["device_id"],
+            "actor_id": row["actor_id"],
+            "status": row["status"],
+            "result": json.loads(row["result"]),
+            "created_at": row["created_at"],
+        }
+
+    def save_batch(self, batch_id, device_id, actor_id, status, result):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO offline_batches(batch_id, device_id, actor_id, status, result, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (batch_id, device_id, actor_id, status, json.dumps(result, ensure_ascii=False, sort_keys=True), utcnow()),
+            )
+
+    def save_adjudication(self, adjudication):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO adjudications(entity_id, kind, status, candidates, decision, decided_by, created_at, decided_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    adjudication["entity_id"],
+                    adjudication["kind"],
+                    adjudication["status"],
+                    json.dumps(adjudication["candidates"], ensure_ascii=False, sort_keys=True),
+                    json.dumps(adjudication["decision"], ensure_ascii=False, sort_keys=True) if adjudication.get("decision") is not None else None,
+                    adjudication.get("decided_by"),
+                    adjudication["created_at"],
+                    adjudication.get("decided_at"),
+                ),
+            )
+
+    def get_adjudication(self, entity_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM adjudications WHERE entity_id = ?", (entity_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return self._adjudication_from_row(row)
+
+    def list_adjudications(self, status=None):
+        clauses = []
+        params = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM adjudications" + where + " ORDER BY created_at, entity_id", params
+            ).fetchall()
+        return [self._adjudication_from_row(row) for row in rows]
+
+    @staticmethod
+    def _adjudication_from_row(row):
+        return {
+            "entity_id": row["entity_id"],
+            "kind": row["kind"],
+            "status": row["status"],
+            "candidates": json.loads(row["candidates"]),
+            "decision": json.loads(row["decision"]) if row["decision"] else None,
+            "decided_by": row["decided_by"],
+            "created_at": row["created_at"],
+            "decided_at": row["decided_at"],
+        }
 
     def ping(self):
         with self._connect() as connection:

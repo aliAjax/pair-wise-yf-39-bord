@@ -85,6 +85,10 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "adjudications"]:
+                    query = parse_qs(parsed.query)
+                    status = query.get("status", [None])[0]
+                    return self._send(200, {"items": service.list_adjudications(status=status)})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -107,6 +111,22 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if parts == ["api", "sync"]:
+                    body = self._body()
+                    batch_id = body.get("batch_id")
+                    device_id = body.get("device_id")
+                    if not batch_id:
+                        raise ValidationError("batch_id is required")
+                    if not device_id:
+                        raise ValidationError("device_id is required")
+                    result = service.sync_batch(
+                        actor, batch_id, device_id, body.get("changes") or []
+                    )
+                    return self._send(200, result)
+                if len(parts) == 4 and parts[:2] == ["api", "adjudications"] and parts[3] == "decide":
+                    body = self._body()
+                    updated = service.decide_adjudication(actor, parts[2], body)
+                    return self._send(200, updated)
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

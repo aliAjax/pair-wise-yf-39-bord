@@ -34,8 +34,22 @@ python3 app.py --db ./data.db --port 8305
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
 - `GET /api/audit`：读取审计记录。
+- `POST /api/sync`：离线批次回网合并，请求体为
+  `{"batch_id":"批次号","device_id":"设备号","changes":[{"seq":序号,"op":"create|update|transition","kind":"observation|sample|cluster","client_id":"端临时ID","entity_id":"服务端ID","baseline_version":基线版本,"data":{...}}]}`。
+  每条改动携带设备号、批次内序号和基线版本；同一批次重传只返回第一次结果，不重复应用。
+- `GET /api/adjudications?status=pending|decided`：读取待站里裁定的冲突。
+- `POST /api/adjudications/<id>/decide`：站里对观察的物种和地点裁定，请求体为
+  `{"candidate_device":"设备号"}` 或 `{"species":"...","location":"..."}`。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
+
+## 离线合并与冲突裁定
+
+- 断网期间各设备在本地改动观察、样本和聚集事件，回网时以批次形式提交。
+- 批次按`seq`顺序应用；`op=create`可用`client_id`作为端临时ID，批次内样本对观察、聚集对观察的引用会自动解析为服务端ID。
+- 改动携带`baseline_version`（设备端最后见到的版本）。若服务端当前版本与基线不一致，说明该观察被其他设备改过：物种和地点各留一版候选（先到设备的版本保留在canonical，后到设备的版本进入裁定候选），不互相覆盖，等站里裁定。
+- 裁定后按选定版本更新观察，并重新核验关联样本状态与聚集成员。
+- 已确认的聚集事件只要成员或坐标改变就重算质心并退回待确认（`draft`）；野外角色不能替站里确认聚集（`confirm_cluster`仅`admin`/`epidemiologist`可执行）。
 
 ## 测试
 
